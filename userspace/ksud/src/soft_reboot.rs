@@ -255,6 +255,16 @@ pub fn soft_reboot() -> Result<()> {
         wait_for_system_server_services(&system_server_services);
     }
 
+    // Wait for Zygote teardown to prevent injection race conditions
+    loop {
+        let z1_stopped = sys_prop::get("init.svc.zygote").as_deref().map_or(true, |v| v == "stopped");
+        let z2_stopped = sys_prop::get("init.svc.zygote_secondary").as_deref().map_or(true, |v| v == "stopped");
+        if z1_stopped && z2_stopped {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     info!("post-fs-data");
     on_post_data_fs()?;
     info!("start");
