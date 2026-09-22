@@ -269,6 +269,21 @@ pub fn soft_reboot() -> Result<()> {
     }
     on_boot_completed();
 
+    // Workaround for wireless debugging dropping on soft reboot
+    // Executed as a detached background process because ksud immediately calls _exit(0)
+    let _ = Command::new("sh")
+        .args([
+            "-c",
+            "( [ \"$(getprop init.svc.bootanim)\" = \"stopped\" ] && resetprop -w init.svc.bootanim >/dev/null; \
+               [ \"$(getprop init.svc.bootanim)\" = \"running\" ] && resetprop -w init.svc.bootanim >/dev/null; \
+               if [ \"$(settings get global adb_wifi_enabled)\" = \"1\" ]; then \
+                   settings put global adb_wifi_enabled 0; \
+                   settings put global adb_wifi_enabled 1; \
+               fi \
+             ) >/dev/null 2>&1 &"
+        ])
+        .spawn();
+
     unsafe {
         _exit(0);
     }
