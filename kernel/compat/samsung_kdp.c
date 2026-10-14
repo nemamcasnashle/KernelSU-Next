@@ -113,8 +113,10 @@ void ksu_samsung_kdp_put_cred(const struct cred *cred)
 #ifdef CONFIG_KSU_SAMSUNG_KDP
 	struct cred *mutable_cred = (struct cred *)cred;
 
-	if (mutable_cred && kdp_usecount_dec_and_test_fn(mutable_cred))
+	if (mutable_cred && kdp_usecount_dec_and_test_fn && kdp_usecount_dec_and_test_fn(mutable_cred))
 		__put_cred(mutable_cred);
+	else
+		put_cred(cred);
 #else
 	put_cred(cred);
 #endif
@@ -166,6 +168,8 @@ int ksu_samsung_kdp_commit_creds(struct cred *cred)
 
 	if (!cred)
 		return -EINVAL;
+	if (!prepare_ro_creds_fn)
+		return commit_creds(cred);
 	INIT_WORK(&commit_work.work, samsung_kdp_commit_worker);
 	init_completion(&commit_work.completion);
 	commit_work.target = current;

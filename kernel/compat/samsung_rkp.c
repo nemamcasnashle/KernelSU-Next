@@ -14,7 +14,7 @@
 #include "policy/allowlist.h"
 
 #if defined(CONFIG_KSU_SAMSUNG_RKP) && defined(CONFIG_KRETPROBES) &&           \
-	defined(__aarch64__)
+	defined(__aarch64__) && !defined(CONFIG_KSU_SUSFS)
 #define SAMSUNG_RKP_BYPASS_NR (-2)
 
 struct samsung_setresuid_work {
@@ -104,7 +104,7 @@ static int newfstatat_pre(struct kprobe *probe, struct pt_regs *regs)
 	(void)probe;
 	if (consume_bypass(__NR_newfstatat))
 		return 0;
-	if (!READ_ONCE(ksu_su_compat_enabled) ||
+	if (!static_branch_likely(&ksu_su_compat_enabled) ||
 	    !ksu_is_allow_uid_for_current(current_uid().val))
 		return 0;
 	instruction_pointer_set(regs, (unsigned long)samsung_newfstatat);
@@ -116,7 +116,7 @@ static int faccessat_pre(struct kprobe *probe, struct pt_regs *regs)
 	(void)probe;
 	if (consume_bypass(__NR_faccessat))
 		return 0;
-	if (!READ_ONCE(ksu_su_compat_enabled) ||
+	if (!static_branch_likely(&ksu_su_compat_enabled) ||
 	    !ksu_is_allow_uid_for_current(current_uid().val))
 		return 0;
 	instruction_pointer_set(regs, (unsigned long)samsung_faccessat);
@@ -194,7 +194,7 @@ static void unregister_syscall_hooks(void)
 int ksu_samsung_rkp_init(void)
 {
 #if defined(CONFIG_KSU_SAMSUNG_RKP) && defined(CONFIG_KRETPROBES) &&           \
-	defined(__aarch64__)
+	defined(__aarch64__) && !defined(CONFIG_KSU_SUSFS)
 	int ret;
 
 	if (!ksu_syscall_table)
@@ -240,7 +240,7 @@ unregister_execve:
 void ksu_samsung_rkp_exit(void)
 {
 #if defined(CONFIG_KSU_SAMSUNG_RKP) && defined(CONFIG_KRETPROBES) &&           \
-	defined(__aarch64__)
+	defined(__aarch64__) && !defined(CONFIG_KSU_SUSFS)
 	if (setresuid_registered) {
 		unregister_kretprobe(&setresuid_kretprobe);
 		setresuid_registered = false;

@@ -12,6 +12,7 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/fs.h>
+#include <linux/types.h>
 #include <asm-generic/errno-base.h>
 #include <net/genetlink.h>
 #include <linux/moduleparam.h>
@@ -21,6 +22,7 @@
 #include <linux/kprobes.h>
 #include <linux/spinlock.h>
 #endif
+#include <linux/version.h>
 // security/selinux/include/security.h
 #include <security.h>
 #include <ss/context.h>
@@ -29,16 +31,34 @@
 #include <ss/conditional.h>
 #include "avc.h"
 #include "klog.h" // IWYU pragma: keep
-#include "linux/kallsyms.h"
 #include "objsec.h"
-#include "hook/patch_memory.h"
 #include "ksu.h"
 #include "policy/feature.h"
+#include "hook/patch_memory.h"
 #include "hook/lsm_hook.h"
 
 static DEFINE_MUTEX(selinux_hide_mutex);
-static bool ksu_selinux_hide_enabled __read_mostly = false;
-static bool ksu_selinux_hide_running __read_mostly = false;
+bool ksu_selinux_hide_enabled __read_mostly = false;
+bool ksu_selinux_hide_running __read_mostly = false;
+
+#ifdef CONFIG_KSU_SUSFS
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+struct selinux_state fake_state;
+#endif
+#endif
+
+#ifndef CONFIG_KSU_SUSFS
+static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
+                                               u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);
+static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
+                                               u32 *scontext_len);
+static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
+                                                 struct av_decision *avd);
+static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
+                                          u16 tclass, u32 permissions, const char *reason) = NULL;
+static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
+                                            struct context *tcontext, u16 tclass, struct av_decision *avd,
+                                            struct extended_perms *xperms) = NULL;
 
 enum sel_inos {
     SEL_ROOT_INO = 2,
@@ -67,19 +87,6 @@ enum sel_inos {
 typedef ssize_t (*write_op_fn)(struct file *, char *, size_t);
 
 static write_op_fn *selinux_write_op;
-
-static int security_context_to_sid_with_policy(struct selinux_policy *policy, const char *scontext, u32 scontext_len,
-                                               u32 *sid, u32 def_sid, gfp_t gfp_flags, u32 *orig_sid_p, int *orig_rc_p);
-static int security_sid_to_context_with_policy(struct selinux_policy *policy, u32 sid, char **scontext,
-                                               u32 *scontext_len);
-static void security_compute_av_user_with_policy(struct selinux_policy *policy, u32 ssid, u32 tsid, u16 tclass,
-                                                 struct av_decision *avd);
-static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext, struct context *tcontext,
-                                          u16 tclass, u32 permissions, const char *reason) = NULL;
-static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
-                                            struct context *tcontext, u16 tclass, struct av_decision *avd,
-                                            struct extended_perms *xperms) = NULL;
-
 static write_op_fn *context_write, *access_write;
 static write_op_fn orig_context_write, orig_access_write;
 
@@ -96,6 +103,11 @@ static write_op_fn orig_context_write, orig_access_write;
 #else
 #define ksu_task_security_struct cred_security_struct
 #endif
+
+static int my_setprocattr(const char *name, void *value, size_t size);
+struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
+
+typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
 
 static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 {
@@ -192,9 +204,6 @@ out:
     return length;
 }
 
-static int my_setprocattr(const char *name, void *value, size_t size);
-struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
-
 /*
  * get the security ID of a set of credentials
  */
@@ -232,8 +241,6 @@ static u32 ptrace_parent_sid(void)
 
     return sid;
 }
-
-typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
 static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
 {
     if (likely(current_uid().val < 10000)) {
@@ -314,10 +321,13 @@ call_orig:
     return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
 }
 
-static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
-static struct page *fake_status = NULL;
 
-static void initialize_fake_status()
+#endif // #ifndef CONFIG_KSU_SUSFS
+
+DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
+struct page *fake_status = NULL;
+
+void initialize_fake_status()
 {
     mutex_lock(&selinux_state.status_lock);
     if (fake_status)
@@ -394,6 +404,7 @@ static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
  * kernel. Keep upstream's replacements, but reach them through function
  * entry kprobes instead of modifying the protected table entries.
  */
+#ifndef CONFIG_KSU_SUSFS
 #define KSU_SELINUX_BYPASS_BITS 4
 
 struct samsung_selinux_bypass {
@@ -405,7 +416,6 @@ static DEFINE_HASHTABLE(samsung_selinux_bypass_tasks, KSU_SELINUX_BYPASS_BITS);
 static DEFINE_SPINLOCK(samsung_selinux_bypass_lock);
 static bool samsung_context_registered;
 static bool samsung_access_registered;
-static bool samsung_status_registered;
 static bool samsung_setprocattr_registered;
 
 static bool samsung_selinux_is_bypassed(void)
@@ -461,15 +471,6 @@ static int samsung_access_pre(struct kprobe *probe, struct pt_regs *regs)
     return 1;
 }
 
-static int samsung_status_pre(struct kprobe *probe, struct pt_regs *regs)
-{
-    (void)probe;
-    if (current_uid().val < 10000 || !READ_ONCE(ksu_selinux_hide_enabled) || !READ_ONCE(fake_status))
-        return 0;
-    instruction_pointer_set(regs, (unsigned long)my_sel_open_handle_status);
-    return 1;
-}
-
 static int samsung_setprocattr_pre(struct kprobe *probe, struct pt_regs *regs)
 {
     (void)probe;
@@ -481,8 +482,21 @@ static int samsung_setprocattr_pre(struct kprobe *probe, struct pt_regs *regs)
 
 static struct kprobe samsung_context_kprobe = { .pre_handler = samsung_context_pre };
 static struct kprobe samsung_access_kprobe = { .pre_handler = samsung_access_pre };
-static struct kprobe samsung_status_kprobe = { .pre_handler = samsung_status_pre };
 static struct kprobe samsung_setprocattr_kprobe = { .pre_handler = samsung_setprocattr_pre };
+#endif // #ifndef CONFIG_KSU_SUSFS
+
+static bool samsung_status_registered;
+
+static int samsung_status_pre(struct kprobe *probe, struct pt_regs *regs)
+{
+    (void)probe;
+    if (current_uid().val < 10000 || !READ_ONCE(ksu_selinux_hide_enabled) || !READ_ONCE(fake_status))
+        return 0;
+    instruction_pointer_set(regs, (unsigned long)my_sel_open_handle_status);
+    return 1;
+}
+
+static struct kprobe samsung_status_kprobe = { .pre_handler = samsung_status_pre };
 
 static int samsung_register_kprobe(struct kprobe *probe, void *target, bool *registered)
 {
@@ -505,22 +519,66 @@ static void samsung_unregister_kprobe(struct kprobe *probe, bool *registered)
 #endif
 
 static void hook_selinux_status_open();
-static void ksu_selinux_hide_unhook();
+static void ksu_selinux_hide_unhook()
+{
+#if defined(CONFIG_KSU_SAMSUNG_RKP) && defined(__aarch64__)
+#ifndef CONFIG_KSU_SUSFS
+    samsung_unregister_kprobe(&samsung_setprocattr_kprobe, &samsung_setprocattr_registered);
+    samsung_unregister_kprobe(&samsung_access_kprobe, &samsung_access_registered);
+    samsung_unregister_kprobe(&samsung_context_kprobe, &samsung_context_registered);
+    selinux_setprocattr_hook.original = NULL;
+    orig_access_write = NULL;
+    orig_context_write = NULL;
+#endif // #ifndef CONFIG_KSU_SUSFS
+    samsung_unregister_kprobe(&samsung_status_kprobe, &samsung_status_registered);
+    orig_sel_open_handle_status = NULL;
+#else
+    int ret;
+#ifndef CONFIG_KSU_SUSFS
+    if (orig_context_write) {
+        ret =
+            ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_context_write = NULL;
+        if (ret) {
+            pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
+        }
+    }
+    if (orig_access_write) {
+        ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_access_write = NULL;
+        if (ret) {
+            pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
+        }
+    }
+    ksu_lsm_unhook(&selinux_setprocattr_hook);
+#endif // #ifndef CONFIG_KSU_SUSFS
+
+    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
+        ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
+                             sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_sel_open_handle_status = NULL;
+        if (ret) {
+            pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
+        }
+    }
+#endif
+}
+
+static void ksu_selinux_hide_disable()
+{
+    pr_info("selinux_hide: exit selinux hide\n");
+    ksu_selinux_hide_unhook();
+}
+
 static int ksu_selinux_hide_enable()
 {
-    int ret;
     pr_info("selinux_hide: init selinux hide\n");
     if (!backup_sepolicy) {
         pr_err("no backup sepolicy available, please save feature and reboot to retry!\n");
         return -EAGAIN;
     }
-    selinux_write_op = find_kernel_symbol_exact("write_op");
-    if (!selinux_write_op) {
-        pr_err("selinux_hide: no write_op found!\n");
-        return -ENOSYS;
-    }
-    hook_selinux_status_open();
 
+#ifndef CONFIG_KSU_SUSFS
     security_dump_masked_av_fn = find_kernel_symbol_exact("security_dump_masked_av");
     if (!security_dump_masked_av_fn) {
         pr_warn("security_dump_masked_av not found!\n");
@@ -528,6 +586,13 @@ static int ksu_selinux_hide_enable()
     context_struct_compute_av_fn = find_kernel_symbol_exact("context_struct_compute_av");
     if (!context_struct_compute_av_fn) {
         pr_warn("context_struct_compute_av not found!\n");
+    }
+
+    int ret;
+    selinux_write_op = find_kernel_symbol_exact("write_op");
+    if (!selinux_write_op) {
+        pr_err("selinux_hide: no write_op found!\n");
+        return -ENOSYS;
     }
 
     context_write = &selinux_write_op[SEL_CONTEXT];
@@ -574,57 +639,27 @@ static int ksu_selinux_hide_enable()
         goto unhook;
     }
 
+
+#endif // #ifndef CONFIG_KSU_SUSFS
+
+#ifdef CONFIG_KSU_SUSFS
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+    fake_state.initialized = true;
+    fake_state.policy = backup_sepolicy;
+#endif
+#endif
+
+    hook_selinux_status_open();
+
     return 0;
 
+
+
+#ifndef CONFIG_KSU_SUSFS
 unhook:
     ksu_selinux_hide_unhook();
     return -ENOSYS;
-}
-
-static void ksu_selinux_hide_unhook()
-{
-#if defined(CONFIG_KSU_SAMSUNG_RKP) && defined(__aarch64__)
-    samsung_unregister_kprobe(&samsung_setprocattr_kprobe, &samsung_setprocattr_registered);
-    samsung_unregister_kprobe(&samsung_access_kprobe, &samsung_access_registered);
-    samsung_unregister_kprobe(&samsung_context_kprobe, &samsung_context_registered);
-    samsung_unregister_kprobe(&samsung_status_kprobe, &samsung_status_registered);
-    selinux_setprocattr_hook.original = NULL;
-    orig_access_write = NULL;
-    orig_context_write = NULL;
-    orig_sel_open_handle_status = NULL;
-#else
-    int ret;
-    if (orig_context_write) {
-        ret =
-            ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
-        orig_context_write = NULL;
-        if (ret) {
-            pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
-        }
-    }
-    if (orig_access_write) {
-        ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
-        orig_access_write = NULL;
-        if (ret) {
-            pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
-        }
-    }
-    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
-        ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
-                             sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
-        orig_sel_open_handle_status = NULL;
-        if (ret) {
-            pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
-        }
-    }
-    ksu_lsm_unhook(&selinux_setprocattr_hook);
 #endif
-}
-
-static void ksu_selinux_hide_disable()
-{
-    pr_info("selinux_hide: exit selinux hide\n");
-    ksu_selinux_hide_unhook();
 }
 
 static int selinux_hide_feature_get(u64 *value)
@@ -653,6 +688,8 @@ static int selinux_hide_feature_set(u64 value)
             ksu_selinux_hide_running = false;
         }
     }
+    pr_info("selinux_hide: ksu_selinux_hide_enabled: %d, ksu_selinux_hide_running: %d\n",
+            ksu_selinux_hide_enabled, ksu_selinux_hide_running);
     mutex_unlock(&selinux_hide_mutex);
     return ret;
 }
@@ -751,6 +788,7 @@ void ksu_selinux_hide_drop_backup_if_unused()
     mutex_unlock(&selinux_hide_mutex);
 }
 
+#ifndef CONFIG_KSU_SUSFS
 /*
  * Caveat:  Mutates scontext.
  */
@@ -1176,7 +1214,7 @@ static int constraint_expr_eval(struct policydb *policydb, struct context *scont
                 l2 = &(scontext->range.level[1]);
                 goto mls_ops;
             case CEXPR_L2H2:
-                l1 = &(tcontext->range.level[0]);
+                l1 = &(scontext->range.level[0]);
                 l2 = &(tcontext->range.level[1]);
                 goto mls_ops;
             mls_ops:
@@ -1409,3 +1447,4 @@ allow:
     avd->allowed = 0xffffffff;
     goto out;
 }
+#endif // #ifndef CONFIG_KSU_SUSFS

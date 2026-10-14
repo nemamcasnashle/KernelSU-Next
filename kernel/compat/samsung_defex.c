@@ -87,6 +87,9 @@ void ksu_samsung_defex_sync_current(void)
 	unsigned short cred_flags;
 	int ret;
 
+	if (!defex_get_task_creds || !defex_set_task_creds)
+		return;
+
 	defex_get_task_creds(current, &stored_uid, &stored_fsuid, &stored_egid,
 			     &cred_flags);
 	if (__kuid_val(cred->euid) == 0 && __kuid_val(cred->fsuid) == 0 &&
